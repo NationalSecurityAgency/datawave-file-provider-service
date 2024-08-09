@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>gov.nsa.datawave.microservice</groupId>
+        <artifactId>datawave-microservice-service-parent</artifactId>
+        <version>5.0.0</version>
+        <relativePath>../../../microservice-service-parent/pom.xml</relativePath>
+    </parent>
+    <artifactId>file-provider-service</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <url>https://github.com/awrigh11/datawave-file-provider-service-awrigh11</url>
+    <scm>
+        <connection>scm:git:https://github.com/awrigh11/datawave-file-provider-service-awrigh11.git</connection>
+        <developerConnection>scm:git:git@github.com:awrigh11/datawave-file-provider-service-awrigh11.git</developerConnection>
+        <tag>HEAD</tag>
+        <url>https://github.com/awrigh11/datawave-file-provider-service-awrigh11</url>
+    </scm>
+    <properties />
+    <dependencyManagement />
+    <dependencies />
+    <repositories>
+        <repository>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+            <id>github-datawave</id>
+            <url>https://maven.pkg.github.com/NationalSecurityAgency/datawave</url>
+        </repository>
+    </repositories>
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>pl.project13.maven</groupId>
+                <artifactId>git-commit-id-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <profile>
+            <id>docker</id>
+            <activation>
+                <property>
+                    <name>microservice-docker</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.spotify</groupId>
+                        <artifactId>docker-maven-plugin</artifactId>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>
