@@ -10,7 +10,6 @@ import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
  * Launcher for the file provider service
  */
 @EnableDiscoveryClient
-@EnableAutoConfiguration
 @SpringBootApplication(scanBasePackages = "datawave.microservice", exclude = {ErrorMvcAutoConfiguration.class})
 public class FileProviderService {
     public static void main(String[] args) {
