@@ -9,12 +9,12 @@
     </parent>
     <artifactId>file-provider-service-api</artifactId>
     <version>1.0.0-SNAPSHOT</version>
-    <url>https://github.com/awrigh11/datawave-file-provider-service-awrigh11</url>
+    <url>https://github.com/NationalSecurityAgency/datawave-file-provider-service</url>
     <scm>
-        <connection>scm:git:https://github.com/awrigh11/datawave-file-provider-service-awrigh11.git</connection>
-        <developerConnection>scm:git:git@github.com:awrigh11/datawave-file-provider-service-awrigh11.git</developerConnection>
+        <connection>scm:git:https://github.com/NationalSecurityAgency/datawave-file-provider-service.git</connection>
+        <developerConnection>scm:git:git@github.com:NationalSecurityAgency/datawave-file-provider-service.git</developerConnection>
         <tag>HEAD</tag>
-        <url>https://github.com/awrigh11/datawave-file-provider-service-awrigh11</url>
+        <url>https://github.com/NationalSecurityAgency/datawave-file-provider-service</url>
     </scm>
     <properties />
     <dependencyManagement />
