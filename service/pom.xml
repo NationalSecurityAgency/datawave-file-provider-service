@@ -28,17 +28,6 @@
                 <artifactId>spring-boot-starter-datawave</artifactId>
                 <version>${version.microservice.starter}</version>
             </dependency>
-            <dependency>
-                <groupId>gov.nsa.datawave.microservice</groupId>
-                <artifactId>spring-boot-starter-datawave-metadata</artifactId>
-                <version>${version.microservice.starter-metadata}</version>
-                <exclusions>
-                    <exclusion>
-                        <artifactId>avro</artifactId>
-                        <groupId>org.apache.avro</groupId>
-                    </exclusion>
-                </exclusions>
-            </dependency>
         </dependencies>
     </dependencyManagement>
     <dependencies>
