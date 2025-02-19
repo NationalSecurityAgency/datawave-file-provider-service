@@ -4,11 +4,11 @@
     <parent>
         <groupId>gov.nsa.datawave.microservice</groupId>
         <artifactId>datawave-microservice-parent</artifactId>
-        <version>4.0.1-depfix</version>
+        <version>4.0.0</version>
         <relativePath>../../microservice-parent/pom.xml</relativePath>
     </parent>
     <artifactId>file-provider-service-parent</artifactId>
-    <version>1.0.0-depfix</version>
+    <version>1.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
     <url>https://github.com/NationalSecurityAgency/datawave-file-provider-service</url>
     <modules>
