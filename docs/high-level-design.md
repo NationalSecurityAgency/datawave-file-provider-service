@@ -14,6 +14,7 @@ The Context Service manages **Accumulo classloader contexts**: named, versioned 
 - **Auto-detection of new files** — files uploaded to a context are detected, packaged, and rolled into a new context version without manual manifest editing.
 - **Context pointer management** — an authoritative, SPI-driven record of the *current* version of each context (ZooKeeper by default), projected into the manifest file the Accumulo classloader polls.
 - **An observable audit trail** — every context change is recorded in a durable, append-only journal in HDFS (SPI-driven) and exposed via the REST API.
+- **Client-side consumption** — a client library for non-tserver JVMs that keeps a per-context classloader current (a ZooKeeper watch on the pointer triggers an immediate manifest re-check) and resolves resource streams and classes through it (§6).
 
 ### 1.1 Background: how the Accumulo classloader consumes a context
 
@@ -29,9 +30,9 @@ The classloader has **no notion of versions, history, or a "current" pointer** �
 
 ### 1.2 Control plane, not data plane
 
-A deliberate, simplicity-driven decision: **Accumulo never reads from this service.** All URLs in generated manifests are `hdfs:` URLs, and the stable manifest that Accumulo polls lives in HDFS. The Context Service is a control plane that writes to HDFS; HDFS is the data plane. Consequences:
+A deliberate, simplicity-driven decision: **no consumer reads from this service on the data path** — not Accumulo, and not client-library JVMs (§6). All URLs in generated manifests are `hdfs:` URLs, and the stable manifest that consumers poll lives in HDFS; the client library additionally reads the pointer from ZooKeeper. The Context Service is a control plane that writes to HDFS and ZooKeeper; HDFS is the data plane. Consequences:
 
-- The service being down never breaks class loading — Accumulo keeps polling HDFS.
+- The service being down never breaks class loading — Accumulo and client-library consumers keep polling HDFS.
 - No file-streaming endpoints, no serving-capacity planning for `N tservers × M contexts` polling traffic.
 - The Accumulo classloader context (the manifest + files in HDFS) remains the **source of truth for the actual files**, per the design guidance. The service's own declarative manifest (§4.1) is an instruction set, not a replacement.
 
@@ -46,17 +47,18 @@ A deliberate, simplicity-driven decision: **Accumulo never reads from this servi
 5. Maintain the current-version pointer behind an SPI, with a ZooKeeper implementation as the default.
 6. Record every mutating operation in an SPI-driven audit journal (HDFS-backed by default) and expose it via API.
 7. Enforce a configurable retention policy that cleans up old version directories in HDFS (§5.7).
-8. Operate as a standard Datawave microservice (starter security, config server, Consul discovery).
+8. Provide a `client` library that mirrors tserver classloading in other JVMs — automatically refreshed on ZooKeeper pointer changes — and lets callers resolve resource streams and classes through the current context classloader (§6).
+9. Operate as a standard Datawave microservice (starter security, config server, Consul discovery).
 
 ### Non-goals (YAGNI — revisit only when a real need appears)
 
 - **Serving JARs/manifests over HTTP to Accumulo** — HDFS is the data plane (§1.2).
 - **Accumulo-side setup.** Three one-time Accumulo-admin actions are prerequisites, not service responsibilities: set `table.class.loader.context` on each table to the context's stable manifest URL; deploy the `hdfs-urlstreamhandler-provider` jar on the Accumulo classpath (required for `hdfs:` URLs); set `general.custom.classloader.ccl.allowed.urls.pattern` to cover the context root (e.g. `hdfs://namenode:8020/datawave/contexts/.*`).
 - **A database.** State lives in HDFS (files, versions, manifests, audit journal) and ZooKeeper (pointer). The service holds only caches rebuilt from those.
-- **Multi-instance coordination / leader election.** Single service instance initially; §9 sketches the upgrade path.
+- **Multi-instance coordination / leader election.** Single service instance initially; §10 sketches the upgrade path.
 - **Dependency/conflict analysis of uploaded JARs**, virus scanning, jar signing.
 - **Poison-file handling** — quarantining/rejecting files that repeatedly fail packaging or publishing. Deliberately deferred to a later discussion (§5.6 notes the hook point); until then a bad file simply keeps the pending set unpublishable, which the publish error surfaces.
-- **Messaging/eventing on context changes** (Spring Cloud Bus broadcast) — consumers poll HDFS via the classloader already.
+- **Messaging/eventing on context changes** (Spring Cloud Bus broadcast) — Accumulo polls HDFS via the classloader, and client-library consumers get push-style refresh from the ZooKeeper pointer watch (§6); no bus needed.
 
 ## 3. Architecture overview
 
@@ -84,6 +86,7 @@ flowchart LR
     end
 
     ACC[Accumulo tservers<br/>CachingClassLoaderFactory]
+    SVCS[Datawave services / tools<br/>Context Client Library]
 
     U -->|upload / publish / activate| API
     D -->|hdfs put| HDFS
@@ -100,6 +103,8 @@ flowchart LR
     AUD -->|append journal| HDFS
     GC -->|delete expired versions| HDFS
     ACC -->|poll current/manifest.json,<br/>fetch jars| HDFS
+    SVCS -->|watch pointer| ZK
+    SVCS -->|re-check current/manifest.json,<br/>fetch jars| HDFS
 ```
 
 Components (all inside the single `service` module — these are classes/packages, not separate deployables):
@@ -112,8 +117,10 @@ Components (all inside the single `service` module — these are classes/package
 | **Jar Packager** | Wraps loose (non-JAR) files into a single generated JAR per version. Uploaded JARs pass through untouched. |
 | **Manifest Generator** | Computes checksums and emits the Accumulo classloader manifest JSON for a version; atomically projects the current version's manifest to the stable path. |
 | **Pointer SPI** | `ContextPointerStore` interface; default `ZookeeperContextPointerStore` (Curator). Authoritative "current version" per context. |
-| **Journal SPI** | `AuditJournalStore` interface; default `HdfsAuditJournalStore` (JSON-lines files in HDFS). Append-only ledger of context events; single writer (§7.2). |
+| **Journal SPI** | `AuditJournalStore` interface; default `HdfsAuditJournalStore` (JSON-lines files in HDFS). Append-only ledger of context events; single writer (§8.2). |
 | **Retention Sweeper** | Periodically deletes version directories that fall outside the configured retention policy (§5.7); never touches the active version. |
+
+The **Context Client Library** (§6) is a separate `client` module that runs inside *consumer* JVMs, not in the service deployable — it appears in the diagram alongside the tservers because, like them, it reads only ZooKeeper and HDFS.
 
 New dependencies beyond the Datawave starter: `hadoop-client` (HDFS), `curator-framework`/`curator-recipes` (the starter has no ZooKeeper/Curator utility to reuse — only Accumulo's own client wiring).
 
@@ -167,14 +174,14 @@ Duration-valued properties (`keep-for`, `sweep-interval`) use Spring's readable 
 │       └── ...
 ├── current/
 │   └── manifest.json                 # stable URL polled by Accumulo (atomic overwrite)
-└── journal/                          # append-only audit journal, JSON lines (§7.2)
+└── journal/                          # append-only audit journal, JSON lines (§8.2)
     └── 2026-08.jsonl                 # rolled monthly
 ```
 
 - **Version IDs are UTC timestamps** (`yyyyMMdd'T'HHmm'Z'`, plus a disambiguating suffix on collision). This satisfies the "date convention" guidance: versions sort chronologically, and "which is newer" is self-evident to a human browsing HDFS.
 - `versions/**` is **immutable**: never rewritten, honoring the classloader's immutability rule (§1.1). Manifests for version N reference `hdfs://…/versions/<version>/<file>` URLs. Each version directory is a self-contained full copy of its files; because tservers cache by filename+checksum, unchanged files carried into a new version cost no tserver re-downloads.
 - `current/manifest.json` is the **only mutable published path**. Activation writes the new manifest to a temp file and atomically replaces the old one — note the plain `FileSystem.rename(src, dst)` returns `false` when `dst` exists; the implementation must use `FileContext.rename(src, dst, Options.Rename.OVERWRITE)`, which is atomic per the HDFS spec. Accumulo tables are configured once with `table.class.loader.context=hdfs://…/<context>/current/manifest.json`.
-- **Supersede contract:** the logical identity of a file is its **exact filename**. A staged file with the same name as one in the previous version supersedes it; latest version of the context wins. Uploaders MUST therefore use stable filenames (`my-iterators.jar`, not `my-iterators-1.3.jar`) — version-stamped names would silently accumulate side-by-side and put duplicate classes on the classpath. As a guard, publish warns (or rejects, configurable) when the pending set contains near-duplicate artifact names (same maven-style prefix, different version suffix). Removal is an explicit API call (§6), not file-deletion detection.
+- **Supersede contract:** the logical identity of a file is its **exact filename**. A staged file with the same name as one in the previous version supersedes it; latest version of the context wins. Uploaders MUST therefore use stable filenames (`my-iterators.jar`, not `my-iterators-1.3.jar`) — version-stamped names would silently accumulate side-by-side and put duplicate classes on the classpath. As a guard, publish warns (or rejects, configurable) when the pending set contains near-duplicate artifact names (same maven-style prefix, different version suffix). Removal is an explicit API call (§7), not file-deletion detection.
 
 ### 4.3 Accumulo manifest (generated output)
 
@@ -226,9 +233,9 @@ Publishing turns the pending change set into a new immutable version; activation
 4. Manifest Generator computes checksums, writes `versions/<v>/manifest.json`.
 5. If activating: Pointer SPI `setCurrent(context, v)` (ZooKeeper), then the manifest is atomically projected to `current/manifest.json`. Order matters — pointer first, projection second; §5.5 covers crash recovery.
 6. Staged files that made it into the version are cleared from `staging/` — matched by name **and** the checksum captured at assembly time, so a file re-uploaded mid-publish is left in staging as pending rather than silently destroyed. This clear is deliberately the **last** step: a failure anywhere earlier leaves staging intact, which is the safety latch that makes publish failures recoverable (§5.6). Every step is audited.
-7. Within `monitorIntervalSeconds`, every tserver polling `current/manifest.json` sees the changed content and swaps in the new classloader.
+7. Within `monitorIntervalSeconds`, every tserver polling `current/manifest.json` sees the changed content and swaps in the new classloader. Client-library consumers (§6) are typically faster: their ZooKeeper pointer watch fires at step 5 and triggers an immediate manifest re-check.
 
-All mutating operations on a context (`publish`, `activate`, `remove`, staging cleanup) are **serialized through a per-context in-process lock** in the Context Manager — trivially correct because the service is single-instance (§2); the §9 leader-election upgrade preserves exactly this invariant across instances.
+All mutating operations on a context (`publish`, `activate`, `remove`, staging cleanup) are **serialized through a per-context in-process lock** in the Context Manager — trivially correct because the service is single-instance (§2); the §10 leader-election upgrade preserves exactly this invariant across instances.
 
 There is **no auto-publish**: detection is automatic, publication is a deliberate human/CI action. This keeps "files are still arriving" races out of scope — the publisher decides when the set is complete. (An optional quiescence-based auto-publish can be layered on later if operations want it.)
 
@@ -271,7 +278,45 @@ Old version directories accumulate in HDFS (each is a self-contained full copy, 
 
 tserver-side there is nothing to coordinate: deleting a version that is not (and never again will be) referenced by any manifest only removes files no classloader will fetch; already-cached jars on tservers age out under the classloader's own cache management.
 
-## 6. REST API sketch
+## 6. Client library (non-tserver consumption)
+
+Accumulo tservers are not the only JVMs that need a context's contents: Datawave services and tools (query microservices, ingest jobs, CLIs) need the same packaged configuration and classes. The `client` module provides that without widening the data plane — the library reads **ZooKeeper and HDFS only**, never the service (§1.2).
+
+### 6.1 Mechanism: embedded upstream classloader, refreshed by a ZooKeeper watch
+
+The client embeds the same `CachingClassLoaderFactory` from [accumulo-classloaders][accumulo-classloaders], pointed at the context's stable `current/manifest.json` URL — so client-side loading is bit-for-bit identical to tserver behavior: same manifest parsing, same digest verification, same local cache keyed by filename+checksum. What the client adds is **automatic, event-driven refresh**:
+
+- A Curator watch on the context's pointer node (`/datawave/context-service/pointers/<context>`, §8.1) fires on every activation.
+- On a watch event, the client triggers an **immediate manifest re-check** instead of waiting out `monitorIntervalSeconds`; when the manifest content has changed, the underlying classloader is rebuilt exactly as it would be on a poll-detected change. The upstream digest comparison makes an early or spurious re-check a harmless no-op.
+- The watch is a **latency optimization, not a correctness mechanism**. Activation writes the pointer before projecting the manifest (§5.3), so a watch event can arrive before `current/manifest.json` changes — the re-check then sees unchanged content, and the regular poll (or a short delayed re-check) picks the change up moments later. Likewise, if ZooKeeper is unreachable the client degrades to plain upstream polling; it never serves stale-forever content.
+
+### 6.2 Caller API: resolution dispatches into the classloader
+
+Callers never see version paths, manifests, or HDFS URLs. The context's current classloader is the focal point that all resolution dispatches into:
+
+```java
+public interface ContextClient extends AutoCloseable {
+    /** Resolve a named resource from the context's current version; empty if absent. */
+    Optional<InputStream> resolveResource(String context, String name);
+
+    /** The context's current classloader, for callers that load classes (plugins, iterators). */
+    ClassLoader getClassLoader(String context);
+
+    /** Invoked after the context's classloader has been swapped to a new version. */
+    void addChangeListener(String context, Consumer<ContextChangeEvent> listener);
+}
+```
+
+- `resolveResource` is the primary call: it dispatches `getResourceAsStream(name)` into the context's current classloader, so a caller asking for `analytics.properties` transparently reads it from the published `context-files.jar` of whichever version is active *at call time*.
+- `getClassLoader` serves callers that need class loading. They **must not cache the returned classloader across versions** — re-fetch it per unit of work or register a change listener; the library swaps the underlying classloader atomically on refresh. (Standard caveat: objects instantiated from an old classloader pin that classloader, and its jars, in memory until they are released.)
+
+### 6.3 Packaging and prerequisites
+
+- `client` is a third Maven module alongside `api` and `service`; it depends on `api` (DTOs), Curator, and the upstream classloader artifact — and has **no runtime dependency on the service**.
+- Like Accumulo, client JVMs need the `hdfs-urlstreamhandler-provider` jar to open `hdfs:` manifest/resource URLs; the client library declares it as a runtime dependency so consumers get it transitively.
+- Configuration is minimal and mirrors the service's own: the ZooKeeper quorum and the HDFS context root.
+
+## 7. REST API sketch
 
 All endpoints under the standard Datawave security model (JWT bearer auth from the starter). Reads require an authorized-user role; mutations require a manager/admin role (`@PreAuthorize`, exact role names per deployment convention).
 
@@ -291,11 +336,11 @@ Contexts themselves are created/removed via the declarative configuration manife
 
 Responses use the Datawave `BaseResponse`/`VoidResponse` envelope conventions; API DTOs live in the `api` module so other services/CLIs can depend on them.
 
-## 7. SPI definitions
+## 8. SPI definitions
 
 Both SPIs are Spring-managed: implementations are beans, selection is by configuration property. "SPI" here means a small stable Java interface in the `api` module — not `ServiceLoader` ceremony.
 
-### 7.1 Context pointer
+### 8.1 Context pointer
 
 ```java
 public interface ContextPointerStore {
@@ -304,11 +349,11 @@ public interface ContextPointerStore {
 }
 ```
 
-**Default: ZooKeeper** (`file-provider.pointer.type=zookeeper`), via Curator against the same ZooKeeper quorum Accumulo already runs — no new infrastructure. Pointer state is a small JSON blob at `/datawave/context-service/pointers/<context>`. ZooKeeper gives atomic pointer swaps, durability independent of the service, and lets other tooling watch pointer changes for free.
+**Default: ZooKeeper** (`file-provider.pointer.type=zookeeper`), via Curator against the same ZooKeeper quorum Accumulo already runs — no new infrastructure. Pointer state is a small JSON blob at `/datawave/context-service/pointers/<context>`. ZooKeeper gives atomic pointer swaps, durability independent of the service, and lets other tooling watch pointer changes for free — the client library (§6) is exactly such a watcher.
 
 Why a pointer store at all, when `current/manifest.json` also encodes "current"? The HDFS file is a *projection* for the classloader (which can only poll a URL); the pointer is the *authoritative record* (with metadata: who activated, when, from what version) that survives a botched projection and drives reconciliation (§5.5). A future `HdfsContextPointerStore` (pointer file in HDFS) is an easy second implementation for deployments that want zero ZooKeeper coupling.
 
-### 7.2 Audit journal
+### 8.2 Audit journal
 
 ```java
 public interface AuditJournalStore {
@@ -319,7 +364,7 @@ public interface AuditJournalStore {
 
 `ContextAuditEvent`: timestamp, context, action (`UPLOAD`, `DETECT`, `REMOVE`, `PUBLISH`, `PUBLISH_FAILED`, `ACTIVATE`, `RECONCILE`, `GC`), principal (from the JWT proxy chain, or `hdfs-autodetect`), version, files affected (name/size/checksum), free-form detail.
 
-**Default: HDFS** (`file-provider.audit.type=hdfs`) — an append-only JSON-lines journal per context at `<context>/journal/<yyyy-MM>.jsonl` (§4.2), one line per event, files rolled monthly. This is an **audit view with durable state**, not a transaction log: the service is the single writer (single instance, §2; the §9 leader-election upgrade preserves single-writer), so plain HDFS create/append semantics suffice — no locking, no compare-and-swap. Rationale:
+**Default: HDFS** (`file-provider.audit.type=hdfs`) — an append-only JSON-lines journal per context at `<context>/journal/<yyyy-MM>.jsonl` (§4.2), one line per event, files rolled monthly. This is an **audit view with durable state**, not a transaction log: the service is the single writer (single instance, §2; the §10 leader-election upgrade preserves single-writer), so plain HDFS create/append semantics suffice — no locking, no compare-and-swap. Rationale:
 
 - No new infrastructure and no database: the journal lives in the same HDFS the service already writes, inherits HDFS replication for durability, and survives service redeploys with no persistent-volume requirement on the service itself.
 - Independently observable: `hdfs dfs -cat .../journal/2026-08.jsonl` gives an operator the full history with standard tooling, even if the service is down.
@@ -329,17 +374,17 @@ public interface AuditJournalStore {
 
 Note this journal is a *context-change ledger*, deliberately distinct from Datawave's `spring-boot-starter-datawave-audit` / `AuditClient`, which is query-execution-shaped and requires the audit microservice; it was evaluated and does not fit file-lifecycle events. If a deployment later wants those events forwarded there too, that is one more `AuditJournalStore` implementation.
 
-## 8. Microservice integration
+## 9. Microservice integration
 
 Follows the established Datawave microservice template (this repo already conforms):
 
-- **Modules:** `api` (DTOs + SPI interfaces, consumable by clients) and `service` (Spring Boot app), parents `datawave-microservice-parent` / `datawave-microservice-service-parent`.
+- **Modules:** `api` (DTOs + SPI interfaces, consumable by clients), `client` (context classloader client library, §6), and `service` (Spring Boot app), parents `datawave-microservice-parent` / `datawave-microservice-service-parent`.
 - **Starter:** `spring-boot-starter-datawave` provides JWT/PKI security, proxied-entity chains, method security, metrics, Undertow, exception handling — nothing security-related is built here.
 - **Config:** `spring.application.name=fileprovider`; declarative context manifest and all `file-provider.*` properties come from the config server (`fileprovider.yml`), so context definitions are change-controlled in the config repo. `@RefreshScope`d so config-repo changes to the context list are picked up without restart.
 - **Discovery:** Consul via `@EnableDiscoveryClient` (already in place).
 - **Health/observability:** actuator health indicators for HDFS reachability, ZooKeeper connectivity, and journal writability; DropWizard metrics via the starter for upload/publish counts and durations, plus retention-sweep results.
 
-## 9. Future considerations (explicitly deferred)
+## 10. Future considerations (explicitly deferred)
 
 - **HA / multiple instances:** add Curator leader election so only the leader runs the Staging Watcher and publish operations (the pieces — Curator, ZooKeeper — are already in the stack). Reads scale horizontally without it.
 - **HTTP data plane:** if a deployment cannot give tservers HDFS access to the context tree, add manifest/jar serving endpoints; the classloader supports `http(s):` (full-GET polling, no conditional requests — capacity math required).
@@ -347,7 +392,7 @@ Follows the established Datawave microservice template (this repo already confor
 - Quiescence-based auto-publish, Spring Cloud Bus change notifications, per-file supersede rules richer than name-based (e.g., date-stamped logical names).
 - **Cache hygiene tooling:** upstream classloader caches don't self-heal corrupted local files; an ops runbook (using upstream's `init-classloader-cache-dir -v`) belongs in operational docs.
 
-## 10. Design decisions summary
+## 11. Design decisions summary
 
 | Decision | Choice | Why |
 |---|---|---|
@@ -358,6 +403,7 @@ Follows the established Datawave microservice template (this repo already confor
 | Upload completion | API = request completion; HDFS drop = `*._COPYING_` rename convention + quiescence | No writer-side protocol needed; `hdfs dfs -put` is already safe |
 | Publish trigger | Explicit API call (auto-detect stages, humans publish) | Avoids publishing half-arrived file sets; simplest correct behavior |
 | Pointer store | SPI, ZooKeeper default (Curator) | Guidance; ZK already deployed for Accumulo; atomic + watchable |
+| Client consumption | `client` module embedding the upstream classloader; ZooKeeper pointer watch triggers immediate manifest re-check; callers resolve streams/classes through the current classloader | Identical load semantics to tservers; watch removes poll latency but correctness never depends on it (degrades to polling); data plane stays HDFS+ZK only |
 | Audit store | SPI, HDFS JSON-lines journal default (single writer; S3 per-event-object variant) | No DB and no new infrastructure; durable via HDFS replication; observable with standard tooling; API-exposed |
 | Onboarding failures | Bounded HDFS retries; staging cleared only after successful publish (safety latch); `manifest.json` written last as completion marker | Failures leave files pending, not lost; no `processing/` dir needed; poison handling deferred |
 | Retention/GC | Sweeper with readable config (`keep-min-versions`, `keep-for`, `sweep-interval`); active + newer versions never deleted | Bounded HDFS growth; operator-legible policy; rollback window is explicit |
